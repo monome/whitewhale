@@ -36,7 +36,11 @@
 	
 
 #define FIRSTRUN_KEY 0x22
+#define CLOCK_DIV_MULT_COUNT 15
+#define AVERAGING_TAPS 3
 
+
+const s8 CLOCK_DIV_MULT[CLOCK_DIV_MULT_COUNT] = {-8, -7, -6, -5, -4, -3, -2, 1, 2, 3, 4, 5, 6, 7, 8};
 
 const u16 SCALES[24][16] = {
 
@@ -136,7 +140,17 @@ u8 quantize_in;
 
 u8 clock_phase;
 u16 clock_time, clock_temp;
+u8 clock_interval_index = 0, show_clock_div_mult = 0;
+s8 clock_div_mult = 1;
+// array size must be == the biggest clock mult/div * 2
+u32 clock_intervals[16] = {120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120};
 u8 series_step;
+
+static const u64 tcMax = (U64)0x7fffffff;
+u64 last_external_ticks = 0;
+u32 external_clock_pulse_width;
+u32 external_taps[AVERAGING_TAPS];
+u8 external_taps_index, external_taps_count;
 
 u16 adc[4];
 u8 SIZE, LENGTH, VARI;
@@ -159,6 +173,8 @@ static void refresh(void);
 static void refresh_mono(void);
 static void refresh_preset(void);
 static void clock(u8 phase);
+static void recalculate_clock_intervals(void);
+u32 get_external_clock_average(void);
 
 // start/stop monome polling/refresh timers
 extern void timers_set_monome(void);
@@ -456,21 +472,56 @@ static softTimer_t keyTimer = { .next = NULL, .prev = NULL };
 static softTimer_t adcTimer = { .next = NULL, .prev = NULL };
 static softTimer_t monomePollTimer = { .next = NULL, .prev = NULL };
 static softTimer_t monomeRefreshTimer  = { .next = NULL, .prev = NULL };
+static softTimer_t showClockDivMultTimer = { .next = NULL, .prev = NULL };
 
 
+
+void recalculate_clock_intervals(void) {
+	// this assumes clock_div_mult is > 0 (multiplication)
+	u32 average = get_external_clock_average();
+	u32 pulse = external_clock_pulse_width;
+	u32 interval = (average << 4) / (u32)clock_div_mult;
+	if (pulse > (interval >> 5)) pulse = interval >> 5;
+	if (pulse == 0) pulse = 1;
+	
+	u32 carryover = 0;
+	for (u8 i = 0; i < (clock_div_mult << 1); i += 2) {
+		clock_intervals[i] = pulse;
+		clock_intervals[i + 1] = ((interval + carryover) >> 4) - pulse;
+		carryover = (interval + carryover) & 15;
+	}
+	
+	clock_time = get_external_clock_average();
+	timer_reset_set(&clockTimer, clock_intervals[0]);
+	clock_interval_index = 1;
+}
+ 
+u32 get_external_clock_average(void) {
+	if (external_taps_count == 0) return 500;
+	u64 total = 0;
+	for (u8 i = 0; i < external_taps_count; i++) total += external_taps[i];
+	return total / (u64)external_taps_count;
+}
 
 static void clockTimer_callback(void* o) {  
 	// static event_t e;
 	// e.type = kEventTimer;
 	// e.data = 0;
 	// event_post(&e);
-	if(clock_external == 0) {
-		// print_dbg("\r\ntimer.");
+	if (!clock_external) {
+		clock_interval_index = !clock_interval_index;
+		clock(clock_interval_index);
+	} else if (clock_div_mult > 1 && clock_interval_index) {
+		timer_reset_set(&clockTimer, clock_intervals[clock_interval_index]);
+		if (++clock_interval_index >= (clock_div_mult << 1)) clock_interval_index = 0;
+		clock(clock_interval_index & 1);
+ 	}	
+}
 
-		clock_phase++;
-		if(clock_phase>1) clock_phase=0;
-		(*clock_pulse)(clock_phase);
-	}
+static void showClockDivMultTimer_callback(void* o) {
+	show_clock_div_mult = 0;
+	timer_remove(&showClockDivMultTimer);
+	monomeFrameDirty++;
 }
 
 static void keyTimer_callback(void* o) {  
@@ -561,6 +612,19 @@ static void handler_MonomeRefresh(s32 data) {
 	if(monomeFrameDirty) {
 		if(preset_mode == 0) (*re)(); //refresh_mono();
 		else refresh_preset();
+		
+		if (show_clock_div_mult)
+		{
+			for (u8 led = 0; led < 16; led++)
+			{
+				monomeLedBuffer[led+112] = 0;
+				if (clock_div_mult < 0) 
+					monomeLedBuffer[led+112] = led > 7 ? 0 : (led > 8 - abs(clock_div_mult) ? 15 : 0);
+				else
+					monomeLedBuffer[led+112] = led < 9 ? 0 : (led - 7 <= clock_div_mult ? 15 : 0);
+			}
+			monomeLedBuffer[120] = clock_div_mult == 1 ? 15 : 8;
+		}		
 
 		(*monome_refresh)();
 	}
@@ -590,12 +654,30 @@ static void handler_PollADC(s32 data) {
 	i = adc[0];
 	i = i>>2;
 	if(i != clock_temp) {
-		// 1000ms - 24ms
-		clock_time = 25000 / (i + 25);
-		// print_dbg("\r\nnew clock (ms): ");
-		// print_dbg_ulong(clock_time);
+		if (clock_external) {
+			// introduce 'dead zones' in knob travel to reduce jitter
+			u16 period = 1024 / CLOCK_DIV_MULT_COUNT;
+			u16 deadzone = period >> 3;
+			if ((i + deadzone) % period > (deadzone << 1)) {
+				u16 div_index = ((i * CLOCK_DIV_MULT_COUNT) >> 10); // should be 0..CLOCK_DIV_MULT_COUNT-1
+				if (div_index >= CLOCK_DIV_MULT_COUNT) div_index = CLOCK_DIV_MULT_COUNT - 1;
+				if (clock_div_mult != CLOCK_DIV_MULT[div_index]) {
+					clock_div_mult = CLOCK_DIV_MULT[div_index];
+					clock_interval_index = clock_interval_index & 1;
+					show_clock_div_mult = 1;
+					timer_remove(&showClockDivMultTimer);
+					timer_add(&showClockDivMultTimer, 1000, &showClockDivMultTimer_callback, NULL);
+					monomeFrameDirty++;
+				}
+			}
+		} else {
+			// 1000ms - 24ms
+			clock_time = 25000 / (i + 25);
+			// print_dbg("\r\nnew clock (ms): ");
+			// print_dbg_ulong(clock_time);
 
-		timer_set(&clockTimer, clock_time);
+			timer_set(&clockTimer, clock_time);
+		}
 	}
 	clock_temp = i;
 
@@ -703,10 +785,43 @@ static void handler_KeyTimer(s32 data) {
 
 static void handler_ClockNormal(s32 data) {
 	clock_external = !gpio_get_pin_value(B09); 
+	clock_temp = 10000;
+	clock_interval_index = 0;
+	if (clock_external) {
+		last_external_ticks = 0;
+		external_clock_pulse_width = 10;
+		external_taps_index = external_taps_count = 0;
+	} 	
 }
 
 static void handler_ClockExt(s32 data) {
-	clock(data); 
+	u64 elapsed = last_external_ticks < tcTicks ? tcTicks - last_external_ticks : tcMax - last_external_ticks + tcTicks;
+	if (data) {
+	    if (last_external_ticks != 0) {
+			if (elapsed < (u64)3600000) {
+				external_taps[external_taps_index] = elapsed;
+				if (++external_taps_index >= AVERAGING_TAPS) external_taps_index = 0;
+				if (external_taps_count < AVERAGING_TAPS) external_taps_count++;
+			}
+		}
+		last_external_ticks = tcTicks;
+	} else external_clock_pulse_width = elapsed;
+
+ 	if (clock_div_mult == 1) {
+		clock(data);
+		return;
+	}
+	
+ 	if (clock_div_mult < 0) {
+		if (clock_interval_index < 2) clock(data);
+ 		if (++clock_interval_index >= (abs(clock_div_mult) << 1)) clock_interval_index = 0;
+ 		return;
+ 	}
+ 	
+	if (!data) return;
+ 	
+ 	recalculate_clock_intervals();
+ 	clock(1);	
 }
 
 
@@ -2072,7 +2187,6 @@ int main(void)
 
 	process_ii = &ww_process_ii;
 
-	clock_pulse = &clock;
 	clock_external = !gpio_get_pin_value(B09);
 
 	timer_add(&clockTimer,120,&clockTimer_callback, NULL);
