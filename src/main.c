@@ -74,8 +74,13 @@ typedef enum {
 } edit_modes;
 
 typedef enum {
-	mForward, mReverse, mDrunk, mRandom
+	mForward=0, mReverse, mDrunk, mRandom, mPing, mPingRep
 } step_modes;
+
+typedef enum {
+    mPingFwd = 1,
+    mPingRev = -1
+} ping_direction;
 
 typedef struct {
 	u8 loop_start, loop_end, loop_len, loop_dir;
@@ -83,6 +88,7 @@ typedef struct {
 	u8 cv_mode[2];
 	u8 tr_mode;
 	step_modes step_mode;
+    ping_direction ping_dir;
 	u8 steps[16];
 	u8 step_probs[16];
 	u16 cv_values[16];
@@ -116,7 +122,7 @@ edit_modes edit_mode;
 u8 edit_cv_step, edit_cv_ch;
 s8 edit_cv_value;
 u8 edit_prob, live_in, scale_select;
-u8 pattern, next_pattern, pattern_jump;
+u8 pattern, next_pattern, pattern_jump, ping_pattern_jump;
 
 u8 series_pos, series_next, series_jump, series_playing, scroll_pos;
 
@@ -238,8 +244,10 @@ void clock(u8 phase) {
 			series_playing = pattern;
 			if(w.wp[pattern].step_mode == mReverse)
 				next_pos = w.wp[pattern].loop_end;
-			else
+			else {
 				next_pos = w.wp[pattern].loop_start;
+                w.wp[pattern].ping_dir = mPingFwd;
+            }
 
 			series_jump = 0;
 			series_step = 0;
@@ -255,7 +263,8 @@ void clock(u8 phase) {
 
 		// calc next step
 		if(w.wp[pattern].step_mode == mForward) { 		// FORWARD
-			if(pos == w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
+			if(pos == w.wp[pattern].loop_end) 
+                next_pos = w.wp[pattern].loop_start;
 			else if(pos >= LENGTH) next_pos = 0;
 			else next_pos++;
 			cut_pos = 0;
@@ -298,6 +307,45 @@ void clock(u8 phase) {
 			if(next_pos > LENGTH) next_pos -= LENGTH + 1;
 			cut_pos = 1;
 		}
+        else if(w.wp[pattern].step_mode == mPing) {     // PING, 12343212
+            if(pos == w.wp[pattern].loop_end && mPingFwd == w.wp[pattern].ping_dir) {
+                w.wp[pattern].ping_dir = mPingRev;
+                next_pos += w.wp[pattern].ping_dir;
+            }
+            else if(pos == w.wp[pattern].loop_start && mPingRev == w.wp[pattern].ping_dir) {
+                w.wp[pattern].ping_dir = mPingFwd;
+                // set this here because this step changes the state needed to identify the switch
+                ping_pattern_jump = 1;
+                next_pos += w.wp[pattern].ping_dir;
+            }
+            else if(pos >= LENGTH) next_pos = 0;
+            else next_pos += w.wp[pattern].ping_dir;
+            cut_pos = 0;
+        }
+        else if(w.wp[pattern].step_mode == mPingRep) {     // PINGREP, 1234432112
+            if(pos == w.wp[pattern].loop_end && mPingFwd == w.wp[pattern].ping_dir) {
+                w.wp[pattern].ping_dir = mPingRev;
+            }
+            else if(pos == w.wp[pattern].loop_end && mPingRev == w.wp[pattern].ping_dir) {
+                next_pos += w.wp[pattern].ping_dir;
+            }
+            else if(pos == w.wp[pattern].loop_start && mPingRev == w.wp[pattern].ping_dir) {
+                w.wp[pattern].ping_dir = mPingFwd;
+                // set this here because this step changes the state needed to identify the switch
+                ping_pattern_jump = 1;
+            }
+            else if(pos == w.wp[pattern].loop_start && mPingFwd == w.wp[pattern].ping_dir) {
+                next_pos += w.wp[pattern].ping_dir;
+            }
+            else if(pos >= LENGTH) next_pos = 0;
+            else next_pos += w.wp[pattern].ping_dir;
+            cut_pos = 0;
+        }
+
+        // guard against -ve next_pos from skip back
+        if (next_pos < 0) {
+            next_pos = 0;
+        }
 
 		// next pattern?
 		if(pos == w.wp[pattern].loop_end && w.wp[pattern].step_mode == mForward) {
@@ -312,9 +360,17 @@ void clock(u8 phase) {
 			else if(next_pattern != pattern)
 				pattern_jump++;
 		}
-		else if(series_step == w.wp[pattern].loop_len) {
+		else if(ping_pattern_jump == 1 && (w.wp[pattern].step_mode == mPing || w.wp[pattern].step_mode == mPingRep)) {
+             if(edit_mode == mSeries) 
+                series_jump++;
+             else if(next_pattern != pattern)
+                pattern_jump++;
+        }
+		else if(series_step == w.wp[pattern].loop_len && w.wp[pattern].step_mode != mPing && w.wp[pattern].step_mode != mPingRep) {
 			series_jump++;
 		}
+        // reset this
+        ping_pattern_jump = 0;
 
 		if(edit_mode == mSeries)
 			series_step++;
@@ -675,6 +731,7 @@ static void handler_KeyTimer(s32 data) {
 
 					w.wp[x].tr_mode = w.wp[pattern].tr_mode;
 					w.wp[x].step_mode = w.wp[pattern].step_mode;
+					w.wp[x].ping_dir = w.wp[pattern].ping_dir;
 
 					pattern = x;
 					next_pattern = x;
@@ -807,37 +864,34 @@ static void handler_MonomeGridKey(s32 data) {
 					keyfirst_pos = x;
 				}
 				else if(key_alt == 1) {
-					if(x == LENGTH)
-						w.wp[pattern].step_mode = mForward;
-					else if(x == LENGTH-1)
-						w.wp[pattern].step_mode = mReverse;
-					else if(x == LENGTH-2)
-						w.wp[pattern].step_mode = mDrunk;
-					else if(x == LENGTH-3)
-						w.wp[pattern].step_mode = mRandom;
-					// FIXME
-					else if(x == 0) {
-						if(pos == w.wp[pattern].loop_start)
-							next_pos = w.wp[pattern].loop_end;
-						else if(pos == 0)
-							next_pos = LENGTH;
-						else next_pos--;
-						cut_pos = 1;
-						monomeFrameDirty++;
-					}
-					// FIXME
-					else if(x == 1) {
-						if(pos == w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
-						else if(pos == LENGTH) next_pos = 0;
-						else next_pos++;
-						cut_pos = 1;
-						monomeFrameDirty++;
-					}
-					else if(x == 2 ) {
-						next_pos = (rnd() % (w.wp[pattern].loop_len + 1)) + w.wp[pattern].loop_start;
-						cut_pos = 1;
-						monomeFrameDirty++;					
-					}
+                    if ((LENGTH > 8  && (LENGTH - x) <= mPingRep) || ((LENGTH - x) <= mPing)) {
+                        // Step modes, mPingRep not available on 8x8 grid
+                        w.wp[pattern].step_mode = LENGTH-x;
+                        w.wp[pattern].ping_dir = mPingFwd;
+                    }
+                    // FIXME
+                    else if(x == 0) {
+                        if(pos == w.wp[pattern].loop_start)
+                            next_pos = w.wp[pattern].loop_end;
+                        else if(pos == 0)
+                            next_pos = LENGTH;
+                        else next_pos--;
+                        cut_pos = 1;
+                        monomeFrameDirty++;
+                    }
+                    // FIXME
+                    else if(x == 1) {
+                        if(pos == w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
+                        else if(pos == LENGTH) next_pos = 0;
+                        else next_pos++;
+                        cut_pos = 1;
+                        monomeFrameDirty++;
+                    }
+                    else if(x == 2 ) {
+                        next_pos = (rnd() % (w.wp[pattern].loop_len + 1)) + w.wp[pattern].loop_start;
+                        cut_pos = 1;
+                        monomeFrameDirty++;					
+                    }
 				}
 			}
 			else if(keycount_pos == 2 && z) {
@@ -1818,7 +1872,7 @@ static void ww_process_ii(uint8_t *data, uint8_t l) {
  			monomeFrameDirty++;
  			break;
  		case WW_PMODE:
-	 		if(d<0 || d>3)
+	 		if(d<mForward || d>mPingRep)
 				break;
  			w.wp[pattern].step_mode = d;
  			break;
@@ -1944,6 +1998,7 @@ void flash_read(void) {
 		w.wp[i1].loop_start = flashy.w[preset_select].wp[i1].loop_start;
 		w.wp[i1].loop_dir = flashy.w[preset_select].wp[i1].loop_dir;
 		w.wp[i1].step_mode = flashy.w[preset_select].wp[i1].step_mode;
+		w.wp[i1].ping_dir = flashy.w[preset_select].wp[i1].ping_dir;
 		w.wp[i1].cv_mode[0] = flashy.w[preset_select].wp[i1].cv_mode[0];
 		w.wp[i1].cv_mode[1] = flashy.w[preset_select].wp[i1].cv_mode[1];
 		w.wp[i1].tr_mode = flashy.w[preset_select].wp[i1].tr_mode;
@@ -2031,6 +2086,7 @@ int main(void)
 			w.wp[i1].loop_start = 0;
 			w.wp[i1].loop_dir = 0;
 			w.wp[i1].step_mode = mForward;
+			w.wp[i1].ping_dir = mPingFwd;
 			w.wp[i1].cv_mode[0] = 0;
 			w.wp[i1].cv_mode[1] = 0;
 			w.wp[i1].tr_mode = 0;
